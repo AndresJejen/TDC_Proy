@@ -5,9 +5,11 @@ import math
 import time
 import tkinter as tk
 from collections import deque
+from queue import Empty, Full, Queue
+from threading import Event, Thread
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, Optional
 
 import serial
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -15,13 +17,14 @@ from matplotlib.figure import Figure
 from serial.tools import list_ports
 
 DEFAULT_BAUDRATE = 115200
-DEFAULT_WINDOW = 500
-DEFAULT_INTERVAL_MS = 100
+DEFAULT_WINDOW = 5000
+DEFAULT_INTERVAL_MS = 30
 DEFAULT_ENCODING = "utf-8"
 MIN_REFERENCE = 0.0
 MAX_REFERENCE = 30.0
-GENERATOR_INTERVAL_MS = 25
-MAX_LINES_PER_POLL = 100
+MIDDLE_REFERENCE = (MAX_REFERENCE - MIN_REFERENCE) / 2.0
+GENERATOR_INTERVAL_MS = 20
+QUEUE_MAX_ITEMS = 2000
 
 CHANNELS = ["Posicion", "Referencia", "usat"]
 CHANNEL_ALIASES = {
@@ -47,7 +50,7 @@ class SerialPlotterApp:
         self.interval_ms = DEFAULT_INTERVAL_MS
 
         self.sample_window: Deque[Sample] = deque(maxlen=DEFAULT_WINDOW)
-        self.history: List[Sample] = []
+        self.history: Deque[Sample] = deque(maxlen=DEFAULT_WINDOW * 2)
 
         self.port_var = tk.StringVar()
         self.baud_var = tk.IntVar(value=DEFAULT_BAUDRATE)
@@ -61,6 +64,12 @@ class SerialPlotterApp:
         self.generator_running = False
         self.generator_job: Optional[str] = None
         self.generator_start_time = 0.0
+
+        self.sample_queue: Queue[tuple[float, Dict[str, float]]] = Queue(maxsize=QUEUE_MAX_ITEMS)
+        self.reader_thread: Optional[Thread] = None
+        self.reader_stop: Optional[Event] = None
+        self.reader_error: Optional[str] = None
+        self.data_dirty = False
 
         self._build_ui()
         self.refresh_ports()
@@ -203,10 +212,15 @@ class SerialPlotterApp:
 
         self.sample_window.clear()
         self.history.clear()
+        self._clear_sample_queue()
+        self.data_dirty = True
+        self.update_plot()
+        self._start_reader_thread()
         self.set_status(f"Connected to {port} @ {baud} baud")
 
     def disconnect(self) -> None:
         self.stop_generator()
+        self._stop_reader_thread()
         if self.serial_conn:
             try:
                 self.serial_conn.close()
@@ -289,12 +303,31 @@ class SerialPlotterApp:
     def _compute_waveform_value(self, waveform: str, frequency: float, elapsed: float, max_value: float) -> float:
         if waveform == "square":
             return max_value if math.sin(2 * math.pi * frequency * elapsed) >= 0 else MIN_REFERENCE
-        return (max_value / 2.0) * (math.sin(2 * math.pi * frequency * elapsed) + 1)
+        return (max_value) * math.sin(2 * math.pi * frequency * elapsed) + MIDDLE_REFERENCE
 
     def send_reference(self, value: float) -> None:
         clamped = max(MIN_REFERENCE, min(MAX_REFERENCE, value))
         command = f"r {clamped:.2f}"
         self._send_serial_command(command, quiet=True)
+
+    def _start_reader_thread(self) -> None:
+        self._stop_reader_thread()
+        if not self.serial_conn:
+            return
+        self.reader_stop = Event()
+        self.reader_thread = Thread(target=self._reader_loop, args=(self.reader_stop,), daemon=True)
+        self.reader_thread.start()
+
+    def _stop_reader_thread(self) -> None:
+        if self.reader_stop:
+            self.reader_stop.set()
+        thread = self.reader_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=0.5)
+        self.reader_thread = None
+        self.reader_stop = None
+        self.reader_error = None
+        self._clear_sample_queue()
 
     def export_csv(self) -> None:
         if not self.history:
@@ -328,48 +361,41 @@ class SerialPlotterApp:
         self.root.after(self.interval_ms, self.poll_serial)
 
     def poll_serial(self) -> None:
-        if self.serial_conn and self.serial_conn.is_open:
-            try:
-                self.read_samples()
-            except serial.SerialException as exc:
-                self.set_status(f"Serial error: {exc}")
-                self.disconnect()
+        if self.reader_error:
+            self.set_status(f"Serial error: {self.reader_error}")
+            self.reader_error = None
+            self.disconnect()
+            return
+
+        drained = self._drain_sample_queue()
+        if drained:
+            self.update_plot()
         self.schedule_poll()
 
-    def read_samples(self) -> None:
-        assert self.serial_conn is not None
-        lines_read = 0
-        while lines_read < MAX_LINES_PER_POLL:
-            raw = self.serial_conn.readline()
-            if not raw:
-                break
-            lines_read += 1
-            try:
-                text = raw.decode(self.encoding, errors="ignore").strip()
-                if not text:
-                    continue
-                parsed = self.parse_values(text)
-                if not parsed or not all(channel in parsed for channel in CHANNELS):
-                    continue
-            except ValueError:
-                continue
-            self._append_sample(parsed)
-
-    def _append_sample(self, values: Dict[str, float]) -> None:
-        timestamp = time.time()
+    def _append_sample(self, values: Dict[str, float], timestamp: Optional[float] = None) -> None:
+        sample_time = timestamp if timestamp is not None else time.time()
         sample_values = {}
         for channel in CHANNELS:
             value = values.get(channel)
             if value is None:
                 continue
             sample_values[channel] = value
-        sample = Sample(timestamp=timestamp, values=sample_values)
+        sample = Sample(timestamp=sample_time, values=sample_values)
         self.sample_window.append(sample)
         self.history.append(sample)
-        self.update_plot()
+        self.data_dirty = True
 
     def update_plot(self) -> None:
+        if not self.data_dirty:
+            return
+
         if not self.sample_window:
+            for line in self.lines.values():
+                line.set_data([], [])
+            self.ax.set_xlim(0, 1)
+            self.ax.set_ylim(0, MAX_REFERENCE + 5)
+            self.canvas.draw_idle()
+            self.data_dirty = False
             return
 
         x_data = list(range(len(self.sample_window)))
@@ -383,6 +409,25 @@ class SerialPlotterApp:
         self.ax.relim()
         self.ax.autoscale_view()
         self.canvas.draw_idle()
+        self.data_dirty = False
+
+    def _clear_sample_queue(self) -> None:
+        while True:
+            try:
+                self.sample_queue.get_nowait()
+            except Empty:
+                break
+
+    def _drain_sample_queue(self) -> bool:
+        drained = False
+        while True:
+            try:
+                timestamp, values = self.sample_queue.get_nowait()
+            except Empty:
+                break
+            self._append_sample(values, timestamp)
+            drained = True
+        return drained
 
     def _sync_window_size(self) -> None:
         try:
@@ -392,6 +437,9 @@ class SerialPlotterApp:
             self.window_var.set(window_size)
         if window_size != (self.sample_window.maxlen or DEFAULT_WINDOW):
             self.sample_window = deque(self.sample_window, maxlen=window_size)
+        history_limit = window_size * 2
+        if history_limit != (self.history.maxlen or history_limit):
+            self.history = deque(self.history, maxlen=history_limit)
         self.set_status(f"Window size set to {window_size} samples")
 
     def set_status(self, message: str) -> None:
@@ -445,6 +493,42 @@ class SerialPlotterApp:
     def _normalize_key(key: str) -> str:
         stripped = key.strip().lstrip(" >#:@")
         return stripped.lower()
+
+    def _reader_loop(self, stop_event: Event) -> None:
+        while not stop_event.is_set():
+            ser = self.serial_conn
+            if ser is None or not ser.is_open:
+                break
+            try:
+                raw = ser.readline()
+            except serial.SerialException as exc:
+                self.reader_error = str(exc)
+                break
+            if not raw:
+                continue
+            try:
+                text = raw.decode(self.encoding, errors="ignore").strip()
+                if not text:
+                    continue
+                parsed = self.parse_values(text)
+                if not parsed or not all(channel in parsed for channel in CHANNELS):
+                    continue
+            except ValueError:
+                continue
+            self._enqueue_sample(time.time(), parsed)
+
+    def _enqueue_sample(self, timestamp: float, values: Dict[str, float]) -> None:
+        try:
+            self.sample_queue.put_nowait((timestamp, values))
+        except Full:
+            try:
+                self.sample_queue.get_nowait()
+            except Empty:
+                pass
+            try:
+                self.sample_queue.put_nowait((timestamp, values))
+            except Full:
+                pass
 
 
 def main() -> None:
