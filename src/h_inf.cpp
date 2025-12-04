@@ -99,11 +99,11 @@ float calibration = 42.0f / 2;   // en cm, porque divides mm/10
 // ============================
 
 float umax = 24.0f;   // V
-float umin = 0.0f;    // V  (puedes subir a 10.0f si quieres que nunca baje de 10V)
+float umin = 5.0f;    // V  (puedes subir a 10.0f si quieres que nunca baje de 10V)
 float deadZone = 0.0f;
 
 // Punto de operación del ventilador (donde empieza a levitar)
-float u0 = 16.25f;    // V (ajústalo luego si hace falta)
+float u0 = 16.0f;    // V (ajústalo luego si hace falta)
 
 
 // ============================
@@ -116,43 +116,43 @@ const int NX = 5;
 
 // Matriz Ad (5x5) – copiar desde MATLAB
 float Ad[NX][NX] = {
-    { 1.0000f,   0.0000f,   0.0000f,   0.0000f,    0.0000f },
-    { 5.6688f,   0.1590f,  -2.0052f,  -8.2034f,  -39.4934f },
-    { 0.2834f,   0.0579f,   0.8997f,  -0.4102f,   -1.9747f },
-    { 0.0035f,   0.0007f,   0.0237f,   0.9949f,   -0.0247f },
-    { 0.0000f,   0.0000f,   0.0001f,   0.0125f,    0.9998f }
+    { 1.0000f,  0.0000f,  0.0000f,  0.0000f,   0.0000f },
+    { 3.4298f,  0.1666f, -1.9432f, -7.7209f, -33.0668f },
+    { 0.1715f,  0.0583f,  0.9028f, -0.3860f,  -1.6533f },
+    { 0.0021f,  0.0007f,  0.0238f,  0.9952f,  -0.0207f },
+    { 0.0000f,  0.0000f,  0.0001f,  0.0125f,   0.9998f }
 };
 
 // Matriz Bd (5x1)
 float Bd[NX] = {
     0.0125f,
-    0.0354f,
-    0.0018f,
+    0.0214f,
+    0.0011f,
     0.0000f,
     0.0000f
 };
 
-// Matriz Cd (1x5) – recuerda: MATLAB mostró 1.0e+03 * [...]
+// Matriz Cd (1x5)
 float Cd[NX] = {
-    63.7135f,    // 0.4695 * 1e3
-   -6.9738f,     // -0.0134 * 1e3
-   -20.6184f,     // -0.0471 * 1e3
-  -91.9744f,     // -0.2504 * 1e3
- -443.8782f      // -2.4044 * 1e3
+   38.5482f,
+   -6.8880f,
+  -19.9215f,
+  -86.5510f,
+ -371.6483f
 };
 
 // Escalar Dd
-float Dd = 0.3982f;
+float Dd = 0.2409f;
 
 // Estado interno del controlador
 float xK[NX] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-float k_hinf = 0.30f;
+float k_hinf = 0.4f;
 
 // ============================
 //  Variables del lazo de control
 // ============================
 
-float reference = -15.0f;  // referencia en cm (mismo sistema que 'y')
+float reference = -23.0f;  // referencia en cm (mismo sistema que 'y')
 float y;                 // posición medida (cm)
 float u;                 // acción de control (útil para debug)
 float e;                 // error
@@ -223,7 +223,9 @@ static void controlTask(void *pvParameters) {
 
         // 2) Calcular error
         e = reference - y;
-
+        float e_max = 10.0f;  // por ejemplo, máximo 10 cm de error efectivo
+        if (e > e_max)  e = e_max;
+        if (e < -e_max) e = -e_max;
         // 3) Controlador H-infinito discreto
         // u_lin(k) = C*xK(k) + D*e(k)
         // 3) Controlador H-infinito discreto
