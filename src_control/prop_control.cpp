@@ -6,7 +6,7 @@ float h = 0.025;
 
 // offset de calibracion para detectar la distancia en positivo con 0 en el 
 //piso del tubo
-float calibration = 42;
+float calibration = 40 / 2;
 
 
 //limites del actuador

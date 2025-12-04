@@ -20,8 +20,8 @@ DEFAULT_BAUDRATE = 115200
 DEFAULT_WINDOW = 5000
 DEFAULT_INTERVAL_MS = 30
 DEFAULT_ENCODING = "utf-8"
-MIN_REFERENCE = 0.0
-MAX_REFERENCE = 30.0
+MIN_REFERENCE = -10.0
+MAX_REFERENCE = 10.0
 MIDDLE_REFERENCE = (MAX_REFERENCE - MIN_REFERENCE) / 2.0
 GENERATOR_INTERVAL_MS = 20
 QUEUE_MAX_ITEMS = 2000
@@ -64,6 +64,9 @@ class SerialPlotterApp:
         self.generator_running = False
         self.generator_job: Optional[str] = None
         self.generator_start_time = 0.0
+        self.last_reference: float = 0.0
+        self.ramp_start_value: Optional[float] = None
+        self.ramp_target_value: Optional[float] = None
 
         self.sample_queue: Queue[tuple[float, Dict[str, float]]] = Queue(maxsize=QUEUE_MAX_ITEMS)
         self.reader_thread: Optional[Thread] = None
@@ -129,7 +132,7 @@ class SerialPlotterApp:
             generator_frame,
             textvariable=self.signal_type_var,
             state="readonly",
-            values=["Sine", "Square"],
+            values=["Sine", "Square", "rampa"],
             width=10,
         )
         waveform_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
@@ -258,6 +261,13 @@ class SerialPlotterApp:
             return
         clamped_max = max(MIN_REFERENCE, min(MAX_REFERENCE, max_value))
         self.max_value_var.set(clamped_max)
+        waveform = self.signal_type_var.get().strip().lower()
+        if waveform == "rampa":
+            self.ramp_start_value = self.last_reference
+            self.ramp_target_value = clamped_max
+        else:
+            self.ramp_start_value = None
+            self.ramp_target_value = None
         self.generator_running = True
         self.generator_start_time = time.perf_counter()
         self.set_status(
@@ -271,6 +281,8 @@ class SerialPlotterApp:
             self.generator_job = None
         if self.generator_running:
             self.generator_running = False
+            self.ramp_start_value = None
+            self.ramp_target_value = None
             self.set_status("Signal generator stopped")
 
     def _schedule_generator_tick(self) -> None:
@@ -296,19 +308,33 @@ class SerialPlotterApp:
         self.max_value_var.set(clamped_max)
         elapsed = time.perf_counter() - self.generator_start_time
         waveform = self.signal_type_var.get().strip().lower()
+        if waveform == "rampa" and self.ramp_start_value is None:
+            self.ramp_start_value = self.last_reference
+            self.ramp_target_value = clamped_max
+            self.generator_start_time = time.perf_counter()
+            elapsed = 0.0
         value = self._compute_waveform_value(waveform, frequency, elapsed, clamped_max)
         self.send_reference(value)
         self._schedule_generator_tick()
 
     def _compute_waveform_value(self, waveform: str, frequency: float, elapsed: float, max_value: float) -> float:
         if waveform == "square":
-            return max_value if math.sin(2 * math.pi * frequency * elapsed) >= 0 else MIN_REFERENCE
-        return (max_value) * math.sin(2 * math.pi * frequency * elapsed) + MIDDLE_REFERENCE
+            return max_value if math.sin(2 * math.pi * frequency * elapsed) >= 0 else -max_value
+        if waveform == "rampa":
+            start = self.ramp_start_value if self.ramp_start_value is not None else self.last_reference
+            target = self.ramp_target_value if self.ramp_target_value is not None else max_value
+            duration = 1.0 / frequency if frequency > 0 else 0.0
+            if duration <= 0:
+                return target
+            phase = min(1.0, elapsed / duration)
+            return start + (target - start) * phase
+        return (max_value) * math.sin(2 * math.pi * frequency * elapsed)
 
     def send_reference(self, value: float) -> None:
         clamped = max(MIN_REFERENCE, min(MAX_REFERENCE, value))
         command = f"r {clamped:.2f}"
         self._send_serial_command(command, quiet=True)
+        self.last_reference = clamped
 
     def _start_reader_thread(self) -> None:
         self._stop_reader_thread()
@@ -381,6 +407,8 @@ class SerialPlotterApp:
                 continue
             sample_values[channel] = value
         sample = Sample(timestamp=sample_time, values=sample_values)
+        if "Referencia" in sample_values:
+            self.last_reference = sample_values["Referencia"]
         self.sample_window.append(sample)
         self.history.append(sample)
         self.data_dirty = True
@@ -393,7 +421,7 @@ class SerialPlotterApp:
             for line in self.lines.values():
                 line.set_data([], [])
             self.ax.set_xlim(0, 1)
-            self.ax.set_ylim(0, MAX_REFERENCE + 5)
+            self.ax.set_ylim(MIN_REFERENCE -20, MAX_REFERENCE + 20)
             self.canvas.draw_idle()
             self.data_dirty = False
             return

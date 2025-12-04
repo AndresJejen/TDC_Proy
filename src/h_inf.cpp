@@ -1,193 +1,298 @@
-#include <definitions.h>
+
+#include <VL53L0X.h>
+// definición de los nucleos en el esp32
+
+#define CORE_0 0   // nucleo base usado por algunas tareas procesador
+#define CORE_1 1   // nucleo para el usuario, poner aqui las tareas críticas
+
+
+// Esta es la configuración del PWM
+#define  FREQUENCY_PWM     1000 // frecuencia del pwa
+#define  RESOLUTION_PWM    8  // bits del pwm
+#define  PIN_PWM           12   // pin del pwm 1   
+#define  CH_PWM     0
+ 
+// factor de conversion de bits a voltios:  2^ #bits -1 / voltios
+float  voltsToPwm =   (pow(2, RESOLUTION_PWM) - 1) / 24; 
+
+
+
+//sensor laser
+//conectar GPIO 22 SCL
+//conectar GPIO 21 a SDA
+VL53L0X sensor;
+
+
+bool setupSensor(void){
+    // we set the laser sensor
+    sensor.setTimeout(100);  
+    if(!sensor.init()){
+        Serial.println("No se detecto sensor");
+        return false;
+        }
+    sensor.startContinuous(); 
+    sensor.setMeasurementTimingBudget(20000);
+    return true;
+}
+
+void setupPwm(void){
+    //ledcAttach(PIN_PWM,  FREQUENCY_PWM , RESOLUTION_PWM);
+    // use las siguientes en PLATTFORMIO en vez de la anterior
+    ledcSetup(CH_PWM, FREQUENCY_PWM, RESOLUTION_PWM);
+    ledcAttachPin(PIN_PWM, CH_PWM);
+    ledcWrite(CH_PWM, 128);  // 50% duty cycle
+}
+
+void voltsToFan(float volts){
+    uint16_t pwm = volts * voltsToPwm;
+    ledcWrite(CH_PWM , pwm); 
+}
+
+
+float movingAverage(float newValue) {
+    const int filterSize = 20;
+    static float filter_values[filterSize] = {0.0};  // Array to store the last 'FILTER_SIZE' values
+    static int index = 0;  // Current index in the array
+    static float sum = 0.0;  // Sum of the current values in the array
+    static int count = 0;  // Number of values added to the filter
+
+    // Subtract the oldest value from sum and replace it with the new value
+    sum = sum - filter_values[index] + newValue;
+    filter_values[index] = newValue;
+
+    // Update the index, and wrap around if necessary
+    index = (index + 1) % filterSize ;
+
+    // Keep track of how many values have been added to the filter
+    if (count < filterSize ) {
+        count++;
+    }
+    // Return the average of the values in the filter
+    return sum / count;
+}
+
+float compDeadZone(float var, float dz){
+    // This function compensates the dead zone of DC motor
+    if (var == 0){
+        return 0;
+    }
+    else {
+        //float sgnvar = abs(var)/var;
+        return var + dz;
+    }
+}
+
+
+// ============================
+//  Parámetros de muestreo
+// ============================
 
 // tiempo de muestreo dejar en 25ms no cambiar
-float h = 0.025;
+float h = 0.025f;   // [s]
+
+// offset de calibracion para detectar la distancia en positivo con 0 en el
+// piso del tubo (tu ajuste experimental)
+float calibration = 42.0f / 2;   // en cm, porque divides mm/10
+
+// ============================
+//  Límites del actuador
+// ============================
+
+float umax = 24.0f;   // V
+float umin = 0.0f;    // V  (puedes subir a 10.0f si quieres que nunca baje de 10V)
+float deadZone = 0.0f;
+
+// Punto de operación del ventilador (donde empieza a levitar)
+float u0 = 16.25f;    // V (ajústalo luego si hace falta)
 
 
-// offset de calibracion para detectar la distancia en positivo con 0 en el 
-//piso del tubo
-float calibration = 44;
+// ============================
+//  Controlador H-infinito Kd
+//  (discreto, Ts = 0.025 s)
+// ============================
 
+// Número de estados del controlador
+const int NX = 5;
 
-//limites del actuador
-float umax = 24;
-float umin = 10;
-float deadZone = 0;
-
-// PID antiguos (los dejé por compatibilidad, pero ya no se usan)
-float kp = 0.09146488923656028;
-float ki = 0.01302963989469797;
-float kd = 0.1712176117412655;
-
-// Parámetros de control (antiguos, se mantienen)
-float Ts = h; // Tiempo de muestreo en segundos
-float Taw = 0.9 * Ts; // Constante anti-windup
-float N = 5.0; // Factor de ancho de banda del derivador
-float beta = 0.0; // Factor de realimentación
-
-// Definición de coeficientes del controlador (antiguos, se mantienen)
-float bi = ki * Ts;
-float ad = kd / (kd + N * Ts);
-float bd = (kd * N) / (kd + N * Ts);
-float br = Ts / Taw;
-
-// Variables del controlador PID (no usadas por Hinf, pero se mantienen para compatibilidad)
-float I = 0.0;
-float D = 0.0;
-float P = 0.0;
-float prev_y = 0.0;
-
-// variables del lazo de control
-float reference = 0.0; 
-float y; // angulo a controlar
-float u; //accion de control
-float e; // error
-float usat; // señal de control saturada
-
-// *** HINF discretizado (Tustin, Ts = 0.025) matrices Ad (7x7), Bd (7x1), C (1x7), D=0
-// Las matrices fueron calculadas desde tu K continuo y discretizadas.
-// NOTA: mantuve precisión en floats para uso en ESP32.
-static float x_state[7] = {0,0,0,0,0,0,0};    // estados
-static float x_new[7];
-
-const float Ad[7][7] = {
-    {  0.99999624f,  -0.0f,         -0.0f,         -0.0f,         -0.0f,         -0.0f,         -0.0f       },
-    {  1.18451581f,   0.30422386f, -0.05172927f, -0.06909544f, -0.16239398f, -0.67953086f, -27.31252043f},
-    {  0.79252975f,   0.77349545f,  0.55134947f, -0.23932834f, -0.25776885f, -0.47226824f, -18.27400666f},
-    {  0.15850595f,   0.15469909f,  0.31026989f,  0.95213433f, -0.05155377f, -0.09445365f,  -3.65480133f},
-    {  0.00792530f,   0.00773495f,  0.01551349f,  0.09760672f,  0.99742231f, -0.00472268f,  -0.18274007f},
-    {  0.00009907f,   0.00009669f,  0.00019392f,  0.00122008f,  0.02496778f,  0.99994097f,  -0.00228426f},
-    {  0.00001830f,  -0.00000874f, -0.00000057f, -0.00000001f,  0.00001718f,  0.00155312f,   0.99957762f}
+// Matriz Ad (5x5) – copiar desde MATLAB
+float Ad[NX][NX] = {
+    { 1.0000f,   0.0000f,   0.0000f,   0.0000f,    0.0000f },
+    { 5.6688f,   0.1590f,  -2.0052f,  -8.2034f,  -39.4934f },
+    { 0.2834f,   0.0579f,   0.8997f,  -0.4102f,   -1.9747f },
+    { 0.0035f,   0.0007f,   0.0237f,   0.9949f,   -0.0247f },
+    { 0.0000f,   0.0000f,   0.0001f,   0.0125f,    0.9998f }
 };
 
-const float Bd[7] = {
-    0.01249998f,
-    0.00740830f,
-    0.00495671f,
-    0.00099134f,
-    0.00004957f,
-    0.00000062f,
-   -0.00000026f
+// Matriz Bd (5x1)
+float Bd[NX] = {
+    0.0125f,
+    0.0354f,
+    0.0018f,
+    0.0000f,
+    0.0000f
 };
 
-const float Ck[7] = { 0.2846f, 3.749f, -0.01205f, -0.01611f, -0.03814f, -0.1583f, -6.564f };
-const float Dk = 0.0f;
+// Matriz Cd (1x5) – recuerda: MATLAB mostró 1.0e+03 * [...]
+float Cd[NX] = {
+    63.7135f,    // 0.4695 * 1e3
+   -6.9738f,     // -0.0134 * 1e3
+   -20.6184f,     // -0.0471 * 1e3
+  -91.9744f,     // -0.2504 * 1e3
+ -443.8782f      // -2.4044 * 1e3
+};
 
-// Prototipos de tareas
+// Escalar Dd
+float Dd = 0.3982f;
+
+// Estado interno del controlador
+float xK[NX] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+float k_hinf = 0.30f;
+
+// ============================
+//  Variables del lazo de control
+// ============================
+
+float reference = -15.0f;  // referencia en cm (mismo sistema que 'y')
+float y;                 // posición medida (cm)
+float u;                 // acción de control (útil para debug)
+float e;                 // error
+float usat;              // señal de control saturada enviada al ventilador
+
 static void controlTask(void *pvParameters);
 static void serialTask(void *pvParameters);
 
-void setup() {
-    // iniciamos el sensor  
-    Wire.begin();
-    while(!setupSensor()){
-      vTaskDelay(1000);
-    }
-    setupPwm();    
-    vTaskDelay(100);
-    Serial.begin(115200);
-    
-    // Asi definimos la tarea de control, de la máxima prioridad en el nucleo 1
-    xTaskCreatePinnedToCore(
-            controlTask, // nombre de la rutina
-            "simple PID controller",
-            8192,
-            NULL,
-            23, // prioridad de la tarea (0-24) , siendo 24 la prioridad más critica      
-            NULL,
-            CORE_1
-    );  
 
+// ============================
+//  Setup
+// ============================
+
+void setup() {
+    // iniciamos el sensor
+    Wire.begin();
+    while (!setupSensor()) {
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+
+    setupPwm();
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    Serial.begin(115200);
+
+    // Tarea de control en el núcleo 1
     xTaskCreatePinnedToCore(
-        serialTask,       // task function
-        "serialTask",     // name
-        4096,             // stack size
-        NULL,             // params
-        1,                // priority
-        NULL,             // task handle
-        CORE_0            // run on CORE_0
+        controlTask,
+        "Hinf controller",
+        8192,
+        NULL,
+        23,       // prioridad alta
+        NULL,
+        CORE_1
+    );
+
+    // Tarea para manejar comandos por Serial (cambiar referencia, etc.)
+    xTaskCreatePinnedToCore(
+        serialTask,
+        "serialTask",
+        4096,
+        NULL,
+        1,
+        NULL,
+        CORE_0
     );
 }
 
 
-/* *************************************************************************
-*                     FUNCION CRITICA DE CONTROL
-***************************************************************************/ 
-
+// ============================
+//  Tarea de control (crítica)
+// ============================
 
 static void controlTask(void *pvParameters) {
 
-    // Aqui configuro cada cuanto se repite la tarea
-    const TickType_t taskInterval = 1000*h;  // repetimos la tarea cada tiempo de muestreo en milisegundos
+    // periodo en ticks (h [s] * 1000 ms/s)
+    const TickType_t taskInterval = (TickType_t)(1000.0f * h);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
 
-    // prototipo de una tarea repetitiva   
     for (;;) {
-       TickType_t xLastWakeTime = xTaskGetTickCount(); 
 
-       // leemos el valor actual del ángulo
-       y = calibration - ((float) sensor.readRangeContinuousMillimeters()/10 );
-       
-       e = reference - y;
+        // 1) Medir posición
+        // sensor.readRangeContinuousMillimeters() -> mm
+        // /10 -> cm, por eso calibration está en cm
+        float medida_mm = (float)sensor.readRangeContinuousMillimeters();
+        float medida_cm = medida_mm / 10.0f;
 
-       // -------------------------------
-       // *** CAMBIO HINF: actualizacion de estados y calculo de u ***
-       // x_{k+1} = Ad * x_k + Bd * y_k
-       for (int i = 0; i < 7; ++i) {
-           float acc = 0.0f;
-           for (int j = 0; j < 7; ++j) {
-               acc += Ad[i][j] * x_state[j];
-           }
-           acc += Bd[i] * y;
-           x_new[i] = acc;
-       }
-       // copiar estados
-       for (int i = 0; i < 7; ++i) x_state[i] = x_new[i];
+        y = calibration - medida_cm;
 
-       // salida u = C * x + D * y
-       float u_calc = 0.0f;
-       for (int i = 0; i < 7; ++i) u_calc += Ck[i] * x_state[i];
-       u_calc += Dk * y; // Dk = 0 en este diseño
+        // 2) Calcular error
+        e = reference - y;
 
-       // aplicar compensacion de zona muerta y saturacion (igual que antes)
-       usat = compDeadZone(u_calc, deadZone);
-       usat = constrain(usat, umin, umax);
-       voltsToFan(usat);
-       // ------------------------------------------------------------
+        // 3) Controlador H-infinito discreto
+        // u_lin(k) = C*xK(k) + D*e(k)
+        // 3) Controlador H-infinito discreto
+        float u_lin = Dd * e;
+        for (int i = 0; i < NX; ++i) {
+            u_lin += Cd[i] * xK[i];
+        }
 
-       // mantenemos impresion igual al original para compatibilidad con tu graficacion
-       Serial.printf(">Posicion:%0.2f, Referencia:%0.2f, usat:%0.2f\r\n", y, reference, usat);
-      
-       // la tarea es crítica entonces esperamos exactamente taskInterval ms antes de activarla nuevamente
-       vTaskDelayUntil(&xLastWakeTime, taskInterval);
+        // Escalamos la salida del controlador (bajamos la “agresividad”)
+        u_lin *= k_hinf;
+
+        // 4) Añadir offset de operación
+        float u_cmd = u0 + u_lin;
+        u = u_cmd;   // guardar para debug si quieres
+
+        // 5) Compensación de zona muerta (siempre puedes poner deadZone>0)
+        u_cmd = compDeadZone(u_cmd, deadZone);
+
+        // 6) Saturación al rango físico del ventilador
+        usat = constrain(u_cmd, umin, umax);
+
+        // 7) Mandar al ventilador
+        voltsToFan(usat);
+
+        // 8) Actualizar estado del controlador
+        // xK(k+1) = Ad*xK(k) + Bd*e(k)
+        float xNext[NX];
+        for (int i = 0; i < NX; ++i) {
+            float acc = Bd[i] * e;
+            for (int j = 0; j < NX; ++j) {
+                acc += Ad[i][j] * xK[j];
+            }
+            xNext[i] = acc;
+        }
+        for (int i = 0; i < NX; ++i) {
+            xK[i] = xNext[i];
+        }
+
+        // 9) Logging para plotear
+        Serial.printf(">Posicion:%0.2f, Referencia:%0.2f, usat:%0.2f\r\n",
+                      y, reference, usat);
+
+        // 10) Esperar hasta la siguiente muestra
+        vTaskDelayUntil(&xLastWakeTime, taskInterval);
     }
-
 }
 
-// Serial handling moved to its own FreeRTOS task
+
+// ============================
+//  Tarea para comandos por Serial
+// ============================
+
 static void serialTask(void *pvParameters) {
     (void) pvParameters;
     for (;;) {
         if (Serial.available()) {
             String input = Serial.readStringUntil('\n');
             input.trim();
+
+            // cambiar referencia: comando "r 10.0" (por ejemplo)
             if (input.startsWith("r ")) {
                 reference = input.substring(2).toFloat();
                 Serial.printf("Nueva referencia: %0.2f\r\n", reference);
             }
 
-            if (input.startsWith("p ")) {
-                kp = input.substring(2).toFloat();
-                Serial.printf("Nuevo kp: %0.2f\r\n", kp);
-            }
-
-            if (input.startsWith("i ")) {
-                ki = input.substring(2).toFloat();
-                Serial.printf("Nuevo ki: %0.2f\r\n", ki);
-            }
-
-            if (input.startsWith("d ")) {
-                kd = input.substring(2).toFloat();
-                Serial.printf("Nuevo kd: %0.2f\r\n", kd);
+            // (Opcional) cambiar u0 en tiempo real:
+            if (input.startsWith("u0 ")) {
+                u0 = input.substring(3).toFloat();
+                Serial.printf("Nuevo u0: %0.2f V\r\n", u0);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(50)); // poll every 50 ms
