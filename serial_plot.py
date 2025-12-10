@@ -26,11 +26,12 @@ MIDDLE_REFERENCE = (MAX_REFERENCE - MIN_REFERENCE) / 2.0
 GENERATOR_INTERVAL_MS = 20
 QUEUE_MAX_ITEMS = 2000
 
-CHANNELS = ["Posicion", "Referencia", "usat"]
+CHANNELS = ["Posicion", "Referencia", "u", "error"]
 CHANNEL_ALIASES = {
     "posicion": "Posicion",
     "referencia": "Referencia",
-    "usat": "usat",
+    "u": "u",
+    "error": "error",
 }
 
 

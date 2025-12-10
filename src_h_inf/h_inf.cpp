@@ -265,8 +265,8 @@ static void controlTask(void *pvParameters) {
         }
 
         // 9) Logging para plotear
-        Serial.printf(">Posicion:%0.2f, Referencia:%0.2f, usat:%0.2f\r\n",
-                      y, reference, usat);
+        Serial.printf(">Posicion:%0.2f, Referencia:%0.2f, u:%0.2f, error:%0.2f\r\n",
+                      y, reference, usat, e);
 
         // 10) Esperar hasta la siguiente muestra
         vTaskDelayUntil(&xLastWakeTime, taskInterval);
